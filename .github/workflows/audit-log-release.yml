@@ -1,0 +1,245 @@
+# Rebuilds every stable DBX release with the audit-log patch
+# (branch feat/web-audit-log) and publishes it to GHCR as
+# ghcr.io/<owner>/dbx:<version>-audit and :latest.
+#
+# Security notes
+# - Top-level permissions are empty; each job asks only for what it needs.
+# - Third-party actions are pinned to full commit SHAs.
+# - Values from outside (release tag, inputs, variables) reach shell steps only
+#   through `env` and are validated against strict patterns before use.
+# - Only stable tags (vX.Y.Z) on upstream main are built (see prepare-release.sh).
+# - Nothing is deployed: updating a server stays a manual decision.
+name: Build DBX release with audit log
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Stable upstream tag to build (e.g. v0.6.69). Empty: latest upstream release."
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the image already exists"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: audit-log-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: t8y2/dbx
+  PATCH_BRANCH: feat/web-audit-log
+  IMAGE_SUFFIX: audit
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  resolve:
+    name: Find release to build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      image: ${{ steps.resolve.outputs.image }}
+      build: ${{ steps.resolve.outputs.build }}
+      latest: ${{ steps.resolve.outputs.latest }}
+    steps:
+      - name: Resolve tag and check registry
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FORCE: ${{ inputs.force }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          latest_tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name)
+          tag=${INPUT_TAG:-$latest_tag}
+          if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Only stable tags (vX.Y.Z) are built, got: $tag"
+            exit 1
+          fi
+          image="ghcr.io/${OWNER,,}/dbx"
+          build=true
+          if [[ $FORCE != true ]]; then
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+            if docker buildx imagetools inspect "$image:$tag-$IMAGE_SUFFIX" >/dev/null 2>&1; then
+              build=false
+            fi
+            docker logout ghcr.io >/dev/null
+          fi
+          {
+            echo "tag=$tag"
+            echo "image=$image"
+            echo "build=$build"
+            echo "latest=$([[ $tag == "$latest_tag" ]] && echo true || echo false)"
+          } >>"$GITHUB_OUTPUT"
+          if [[ $build == true ]]; then
+            echo "Building $image:$tag-$IMAGE_SUFFIX" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "$image:$tag-$IMAGE_SUFFIX already exists, nothing to do." >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build ${{ needs.resolve.outputs.tag }}-audit
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+      issues: write
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      IMAGE: ${{ needs.resolve.outputs.image }}
+      IS_LATEST: ${{ needs.resolve.outputs.latest }}
+      SRC: ${{ github.workspace }}/dbx-src
+    steps:
+      - name: Check out build scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
+          sparse-checkout: .github/scripts/audit-log
+          persist-credentials: false
+
+      - name: Apply audit-log patch to the release
+        id: prepare
+        env:
+          FORK_REPO: ${{ github.repository }}
+          WORKDIR: ${{ github.workspace }}/dbx-src
+        run: bash fork/.github/scripts/audit-log/prepare-release.sh
+
+      - name: Validate platforms
+        id: platforms
+        env:
+          PLATFORMS: ${{ vars.AUDIT_PLATFORMS || 'linux/amd64' }}
+        run: |
+          set -euo pipefail
+          if [[ ! $PLATFORMS =~ ^linux/(amd64|arm64)(,linux/(amd64|arm64))?$ ]]; then
+            echo "::error::AUDIT_PLATFORMS must be linux/amd64, linux/arm64 or both, comma separated"
+            exit 1
+          fi
+          echo "list=$PLATFORMS" >>"$GITHUB_OUTPUT"
+          [[ $PLATFORMS == *arm64* ]] && echo "arm64=true" >>"$GITHUB_OUTPUT" || echo "arm64=false" >>"$GITHUB_OUTPUT"
+
+      - name: Install Rust and system packages
+        if: steps.prepare.outputs.already_upstream != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends pkg-config libdbus-1-dev
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+
+      - name: Test audit log
+        if: steps.prepare.outputs.already_upstream != 'true'
+        working-directory: dbx-src
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+          RUST_MIN_STACK: "8388608"
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -euo pipefail
+          cargo test --locked -p dbx-web --no-default-features -- audit::
+          cargo test --locked -p dbx-mcp --no-default-features --lib http_auth
+          # The test build is not needed by Docker; free the disk for it.
+          rm -rf target
+
+      - name: Set up QEMU
+        if: steps.platforms.outputs.arm64 == 'true'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<EOF"
+            echo "$IMAGE:$RELEASE_TAG-$IMAGE_SUFFIX"
+            if [[ $IS_LATEST == true ]]; then echo "$IMAGE:latest"; fi
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: dbx-src
+          file: dbx-src/deploy/Dockerfile
+          platforms: ${{ steps.platforms.outputs.list }}
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}-audit
+            org.opencontainers.image.revision=${{ steps.prepare.outputs.source_commit }}
+            org.opencontainers.image.description=DBX ${{ needs.resolve.outputs.tag }} (t8y2/dbx) with the opt-in web audit log
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=audit-log
+          cache-to: type=gha,scope=audit-log,mode=max
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          UPSTREAM_COMMIT: ${{ steps.prepare.outputs.tag_commit }}
+          SOURCE_COMMIT: ${{ steps.prepare.outputs.source_commit }}
+          ALREADY_UPSTREAM: ${{ steps.prepare.outputs.already_upstream }}
+        run: |
+          {
+            echo "### $IMAGE:$RELEASE_TAG-$IMAGE_SUFFIX"
+            echo
+            echo "- Upstream release: \`$UPSTREAM_REPO@$RELEASE_TAG\` (\`$UPSTREAM_COMMIT\`)"
+            echo "- Built source: \`$SOURCE_COMMIT\`"
+            echo "- Digest: \`$DIGEST\`"
+            if [[ $ALREADY_UPSTREAM == true ]]; then
+              echo
+              echo "> The audit log is now part of upstream DBX: the official image can be used instead."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CONFLICTS: ${{ steps.prepare.outputs.conflict_files }}
+          PREPARE: ${{ steps.prepare.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Audit log build failed for DBX $RELEASE_TAG"
+          if [[ -n $CONFLICTS ]]; then
+            reason="The audit-log patch no longer applies to this release. Conflicting files: \`$CONFLICTS\`. Rebase \`$PATCH_BRANCH\` onto \`$RELEASE_TAG\` (or upstream main), resolve, force-push, then re-run the workflow."
+          elif [[ $PREPARE == failure ]]; then
+            reason="Preparing the release source failed (untrusted tag, branch problem or network)."
+          else
+            reason="Tests or the Docker build failed."
+          fi
+          body="$reason"$'\n\n'"Run: $RUN_URL"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [[ -n $existing ]]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
